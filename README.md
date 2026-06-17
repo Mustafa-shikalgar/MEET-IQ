@@ -138,4 +138,3 @@ npm run dev
 - Visual captures of regions are intentionally restricted to user-defined boundary boxes to prevent capturing sensitive out-of-bounds screen data.
 
 ---
-*Built with ❤️ for the future of asynchronous work.*
