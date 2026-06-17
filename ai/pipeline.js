@@ -1,0 +1,218 @@
+/**
+ * pipeline.js
+ * Ties together: Python Audio/Transcription (via Express) → Transcriber → TaskDetector → Summarizer
+ * Emits events consumed by the Express backend which forwards to Electron IPC.
+ */
+const { EventEmitter } = require('events');
+const { transcribeChunk, resetTranscriberState } = require('./transcriber');
+const { extractTasks, normalizeTask, areSimilar }  = require('./taskDetector');
+const { generateSummary }                          = require('./summarizer');
+const { detectOpenQuestion, detectFollowUp, isSimilarInsight } = require('./insightDetector');
+
+class MeetingPipeline extends EventEmitter {
+  constructor() {
+    super();
+    this.fullTranscript = '';
+    this.imageContexts  = [];
+    this.seenTasks      = new Set();
+    this.openQuestions  = [];
+    this.followUps      = [];
+    this.isRunning      = false;
+    this._summaryTimer  = null;
+    this.queue          = [];
+    this.isProcessing   = false;
+  }
+
+  start() {
+    if (this.isRunning) return;
+    this.isRunning     = true;
+    this.fullTranscript = '';
+    this.imageContexts  = [];
+    this.seenTasks      = new Set();
+    this.openQuestions  = [];
+    this.followUps      = [];
+    this.queue          = [];
+    this.isProcessing   = false;
+
+    // Reset Whisper transcriber context for new meeting
+    resetTranscriberState();
+
+    // Rolling summary every 30 seconds
+    this._summaryTimer = setInterval(async () => {
+      if (!this.fullTranscript.trim()) return;
+      const summary = await generateSummary(this.fullTranscript);
+      if (summary) {
+        this.emit('summary', { text: summary, timestamp: new Date().toISOString() });
+      }
+    }, 30000);
+
+    console.log('[Pipeline] started');
+  }
+
+  /**
+   * Adds a screen description to the rolling image context buffer.
+   * Keeps only the last 5 descriptions to avoid prompt bloat.
+   * @param {string} description
+   */
+  addImageContext(description) {
+    if (!description) return;
+    this.imageContexts.push(description);
+    if (this.imageContexts.length > 5) {
+      this.imageContexts.shift();
+    }
+    console.log('[Pipeline] Image context added. Buffer size:', this.imageContexts.length);
+    // Always trigger a summary push when new visual context arrives
+    this._triggerSummary();
+  }
+
+  async _triggerSummary() {
+    // Allow summary from images alone even if transcript is empty
+    const hasTranscript = this.fullTranscript.trim().length > 0;
+    const hasImages     = this.imageContexts.length > 0;
+    if (!hasTranscript && !hasImages) return;
+
+    const textForSummary = hasTranscript
+      ? this.fullTranscript
+      : 'No verbal transcript yet — summarize based on the visual context only.';
+
+    const summary = await generateSummary(textForSummary, this.imageContexts);
+    if (summary) {
+      this.emit('summary', { text: summary, timestamp: new Date().toISOString() });
+    }
+  }
+
+  /**
+   * Handles raw transcript text from local Vosk service
+   */
+  handleTranscript(text) {
+    if (!this.isRunning || !text) return;
+
+    console.log('[Pipeline] Received transcript text:', text);
+
+    // Split into sentences
+    const sentences = text.match(/[^.!?]+[.!?]*/g) || [text];
+    this.fullTranscript += ' ' + text;
+
+    // Memory Guard: Cap at 20,000 chars to avoid infinite growth
+    if (this.fullTranscript.length > 20000) {
+      console.log('[Pipeline] Capping transcript length');
+      this.fullTranscript = this.fullTranscript.slice(-15000);
+    }
+
+    // Emit each sentence with detected tasks
+    for (const sentence of sentences) {
+      const trimmedSentence = sentence.trim();
+      if (!trimmedSentence) continue;
+
+      const tasks = extractTasks(trimmedSentence);
+
+      // ── Open question detection ──
+      const oq = detectOpenQuestion(trimmedSentence);
+      if (oq) {
+        const isDupQ = this.openQuestions.some(q => isSimilarInsight(q.question, oq.question));
+        if (!isDupQ) {
+          this.openQuestions.push(oq);
+          this.emit('open-question', oq);
+        }
+      }
+
+      // ── Follow-up detection ──
+      const fu = detectFollowUp(trimmedSentence);
+      if (fu) {
+        const isDupF = this.followUps.some(f => isSimilarInsight(f.context, fu.context));
+        if (!isDupF) {
+          this.followUps.push(fu);
+          this.emit('follow-up', fu);
+        }
+      }
+
+      this.emit('transcript', {
+        text: trimmedSentence,
+        timestamp: new Date().toISOString(),
+      });
+
+      for (const task of tasks) {
+        const key = task.normalized || normalizeTask(task.task);
+        const isDup = [...this.seenTasks].some(seen => areSimilar(seen, key));
+        if (isDup) {
+          console.log('[Pipeline] Skipping duplicate task:', task.task);
+          continue;
+        }
+        this.seenTasks.add(key);
+        const { normalized: _n, ...cleanTask } = task;
+        this.emit('task', cleanTask);
+      }
+    }
+  }
+
+  /**
+   * Primary path: Handles preprocessed audio chunks from Python → Whisper API
+   */
+  handleAudioChunk(chunk) {
+    if (!this.isRunning) return;
+    
+    if (!chunk || chunk.length < 2000) {
+      console.warn('[Pipeline] Skipping small audio chunk:', chunk ? chunk.length : 0);
+      return;
+    }
+
+    console.log('📦 Received:', chunk.length, 'Queue size:', this.queue.length);
+    this.queue.push(chunk);
+    this.processQueue();
+  }
+
+  async processQueue() {
+    if (this.isProcessing) return;
+    this.isProcessing = true;
+
+    while (this.queue.length > 0) {
+      const chunk = this.queue.shift();
+
+      try {
+        const text = await transcribeChunk(chunk);
+        if (!text) continue;
+
+        // Process transcribed text as if it came from the /transcript endpoint
+        this.handleTranscript(text);
+      } catch (err) {
+        console.error('[Pipeline] Queue error:', err);
+      }
+    }
+
+    this.isProcessing = false;
+  }
+
+  async stop() {
+    if (!this.isRunning) {
+      return { transcript: (this.fullTranscript || '').trim(), summary: '' };
+    }
+    this.isRunning = false;
+    clearInterval(this._summaryTimer);
+
+    // Reset transcriber state
+    resetTranscriberState();
+    this.seenTasks     = new Set();
+    this.openQuestions = [];
+    this.followUps     = [];
+    
+    // Clear queue on stop
+    this.queue = [];
+    this.isProcessing = false;
+
+    // Final summary (include all collected image contexts)
+    const summary = await generateSummary(this.fullTranscript, this.imageContexts);
+    this.emit('summary', { text: summary, timestamp: new Date().toISOString(), isFinal: true });
+    console.log('[Pipeline] stopped');
+
+    return {
+      transcript: this.fullTranscript.trim(),
+      summary,
+    };
+  }
+
+  getTranscript() {
+    return this.fullTranscript;
+  }
+}
+
+module.exports = new MeetingPipeline();
