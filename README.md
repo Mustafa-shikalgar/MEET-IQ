@@ -43,7 +43,7 @@
 - **Task Detection on the Fly:** Instantly identifies action items, who they are assigned to, and their priority level with an AI confidence score.
 
 ### 📸 Smart Visual Context & Region Monitoring
-- **Automated Screen Capture:** Select a specific region of your screen (like a presentation slide or architectural diagram) for Observer AI to monitor.
+- **Automated Screen Capture:** Select a specific region of your screen (like a presentation slide or architectural diagram) for MEET-IQ to monitor.
 - **Visual Intelligence:** Uses advanced Vision models (via Groq) to analyze visual changes, seamlessly weaving slide text, charts, and diagrams into your post-meeting summary. 
 
 ### 🗂️ Comprehensive Post-Meeting Summaries
